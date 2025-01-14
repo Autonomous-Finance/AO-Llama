@@ -130,7 +130,7 @@ return Llama.info()
     assert.ok(result.response.Output.data.output.length > 10)
   })
 
-  it.skip('AOS runs smolllm 1.7B', async () => {
+  it('AOS runs smolllm 1.7B', async () => {
     const result = await handle(
       getLua('SmolLM2-1.7B-Instruct-Q6_K.gguf', 250),
       getEnv())
@@ -139,7 +139,7 @@ return Llama.info()
     assert.ok(result.response.Output.data.length > 10)
   })
 
-  it('AOS runs nemo (q4)', async () => {
+  it.skip('AOS runs nemo (q4)', async () => {
     const result = await handle(
       getLua('MN-12B-Starcannon-v2.Q4_K_M.gguf', 100), //MN-12B-Starcannon-v2.Q4_K_M.gguf
       getEnv())

@@ -25,14 +25,6 @@
 
 #define DEBUG_PRINT(...) do { if (DEBUG_MODE) fprintf(stderr, __VA_ARGS__); } while (0)
 
-// Checkpoint structure to store system prompt state
-struct checkpoint_state {
-    std::string prompt;
-    std::vector<llama_token> tokens;
-    int tokens_processed;
-    bool is_valid;
-};
-
 struct params_struct {
     std::string model;
     std::string prompt;
@@ -53,7 +45,6 @@ static llama_model* model = nullptr;
 static llama_batch batch = {};
 static llama_context* ctx = nullptr;
 static int tks_processed = 0;
-static checkpoint_state system_checkpoint = {.is_valid = false};  // Store system prompt state
 
 extern "C" bool l_llama_on_progress(float progress, void* user_data);
 extern "C" void l_llama_on_log(enum ggml_log_level level, const char* text, void* user_data);
@@ -157,51 +148,6 @@ void llama_reset_context() {
     }
 }
 
-// Function to create a checkpoint of the current state
-void create_system_checkpoint() {
-    if (!ctx || !model) return;
-    
-    system_checkpoint.prompt = params.prompt;
-    system_checkpoint.tokens_processed = tks_processed;
-    system_checkpoint.is_valid = true;
-    
-    // Store the current token sequence
-    if (batch.n_tokens > 0) {
-        system_checkpoint.tokens.resize(batch.n_tokens);
-        std::copy(batch.token, batch.token + batch.n_tokens, system_checkpoint.tokens.begin());
-    }
-}
-
-// Function to restore from checkpoint
-bool restore_system_checkpoint() {
-    if (!system_checkpoint.is_valid || !model) {
-        return false;
-    }
-    
-    // Reset context and restore from checkpoint
-    llama_reset_context();
-    params.prompt = system_checkpoint.prompt;
-    
-    // Replay the tokens from checkpoint
-    for (size_t i = 0; i < system_checkpoint.tokens.size(); i++) {
-        if (batch.n_tokens >= BATCH_SIZE) {
-            return false;
-        }
-        common_batch_add(batch, system_checkpoint.tokens[i], i, {0}, 
-                        i == system_checkpoint.tokens.size() - 1);
-    }
-    
-    if (batch.n_tokens > 0) {
-        batch.logits[batch.n_tokens - 1] = true;
-        if (llama_decode(ctx, batch) != 0) {
-            return false;
-        }
-    }
-    
-    tks_processed = system_checkpoint.tokens_processed;
-    return true;
-}
-
 extern "C" int llama_set_prompt(char* prompt) {
     if (!prompt || !model) {
         l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Invalid prompt or model not loaded", nullptr);
@@ -223,6 +169,7 @@ extern "C" int llama_set_prompt(char* prompt) {
         return 1;
     }
 
+    // Add the BOS token explicitly:
     common_batch_add(batch, llama_token_bos(model), 0, {0}, false);
 
     if (llama_decode(ctx, batch) != 0) {
@@ -231,6 +178,7 @@ extern "C" int llama_set_prompt(char* prompt) {
     }
     tks_processed++;
 
+    // Keep chunking logic the same, but remove batch.logits[...] = true
     const size_t chunk_size = BATCH_SIZE - 1; 
     for (size_t i = 0; i < tokens_list.size(); i += chunk_size) {
         common_batch_clear(batch);
@@ -247,28 +195,17 @@ extern "C" int llama_set_prompt(char* prompt) {
             tks_processed++;
         }
 
-        if (batch.n_tokens > 0) {
-            batch.logits[batch.n_tokens - 1] = true;
-        }
+        // ---- REMOVED:
+        // if (batch.n_tokens > 0) {
+        //     batch.logits[batch.n_tokens - 1] = true;
+        // }
 
         if (llama_decode(ctx, batch) != 0) {
             l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Decode failed for chunk", nullptr);
             return 1;
         }
     }
-
-    // Create checkpoint after system prompt is processed
-    create_system_checkpoint();
     
-    return 0;
-}
-
-// Add function to expose checkpoint restoration
-extern "C" int llama_restore_checkpoint() {
-    if (!restore_system_checkpoint()) {
-        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to restore checkpoint", nullptr);
-        return 1;
-    }
     return 0;
 }
 
@@ -302,8 +239,8 @@ extern "C" char* llama_next() {
     }
 
     // ====================================================================================
-    // SAMPLING CHAIN CLOSE TO LLAMA CLI:
-    // 1) Apply repetition/presence/frequency penalty
+    // SAMPLING CHAIN (repetition, top_k, top_p, temp, etc.) - unchanged
+    // ====================================================================================
     if (params.repeat_penalty != 1.0f && params.repeat_last_n > 0) {
         int n_tokens = std::min(params.repeat_last_n, tks_processed);
         if (n_tokens > 0 && (size_t)batch.n_tokens >= (size_t)n_tokens) {
@@ -316,15 +253,10 @@ extern "C" char* llama_next() {
                 llama_token tk = kv.first;
                 int count = kv.second;
                 if (tk >= 0 && tk < n_vocab) {
-                    // repetition penalty
                     logits[tk] /= params.repeat_penalty;
-
-                    // presence penalty
                     if (params.presence_penalty > 0.0f && count > 0) {
                         logits[tk] -= params.presence_penalty;
                     }
-
-                    // frequency penalty
                     if (params.frequency_penalty > 0.0f && count > 0) {
                         logits[tk] -= params.frequency_penalty * count;
                     }
@@ -333,14 +265,12 @@ extern "C" char* llama_next() {
         }
     }
 
-    // Build candidate list
     std::vector<std::pair<float,int>> candidates;
     candidates.reserve(n_vocab);
     for (int i = 0; i < n_vocab; i++) {
         candidates.push_back({logits[i], i});
     }
 
-    // 2) top_k filtering
     std::sort(candidates.begin(), candidates.end(),
               [](const auto &a, const auto &b) { return a.first > b.first; });
 
@@ -348,7 +278,6 @@ extern "C" char* llama_next() {
         candidates.resize(params.top_k);
     }
 
-    // Now compute softmax probabilities for the top_k set
     float max_logit = -INFINITY;
     for (auto &c : candidates) {
         if (c.first > max_logit) max_logit = c.first;
@@ -364,7 +293,6 @@ extern "C" char* llama_next() {
         c.first /= sum_exp;
     }
 
-    // 3) top_p filtering
     if (params.top_p > 0.0f && params.top_p < 1.0f) {
         std::sort(candidates.begin(), candidates.end(),
                   [](auto &a, auto &b){ return a.first > b.first;});
@@ -380,7 +308,6 @@ extern "C" char* llama_next() {
         if (cutoff < candidates.size()) {
             candidates.resize(cutoff);
         }
-        // renormalize
         float new_sum = 0.0f;
         for (auto &c : candidates) new_sum += c.first;
         if (new_sum > 0.0f) {
@@ -388,7 +315,6 @@ extern "C" char* llama_next() {
         }
     }
 
-    // 4) min_p filtering
     if (params.min_p > 0.0f && params.min_p < 1.0f) {
         std::vector<std::pair<float,int>> filtered;
         filtered.reserve(candidates.size());
@@ -407,12 +333,7 @@ extern "C" char* llama_next() {
         }
     }
 
-    // 5) temperature scaling (applied last)
     if (params.temperature > 0.0f && params.temperature != 1.0f) {
-        // Convert probabilities back to logits
-        // p = exp(logit - max_logit)/sum_exp => logit = log(p*sum_exp)+max_logit
-        // but since we lost original sum_exp after top_k, let's just do a stable log:
-        // logit = log(p), then divide by temp, then softmax again.
         std::vector<float> new_logits;
         new_logits.reserve(candidates.size());
         for (auto &c : candidates) {
@@ -430,14 +351,10 @@ extern "C" char* llama_next() {
     }
 
     if (candidates.empty()) {
-        // fallback if no candidates
         l_llama_on_log(GGML_LOG_LEVEL_WARN, "All candidates removed by filtering. Using highest logit token.", nullptr);
-        // fallback to the first token of original top_k before filtering
-        // If empty, fallback to just token 0
         candidates.push_back({1.0f, 0});
     }
 
-    // Sample
     float r = (float)rand() / (float)RAND_MAX;
     float cumsum = 0.0f;
     int new_token_id = candidates[0].second;
@@ -459,7 +376,6 @@ extern "C" char* llama_next() {
     if (token_str) {
         token_text = token_str;
         if (token_text.empty()) {
-            // Try piece conversion if text is empty
             char piece[MAX_TOKEN_LEN];
             int token_len = llama_token_to_piece(model, new_token_id, piece, sizeof(piece)-1, 0, false);
             if (token_len > 0) {
@@ -478,7 +394,6 @@ extern "C" char* llama_next() {
         token_text = piece;
     }
 
-    // Skip empty tokens
     if (token_text.empty()) {
         l_llama_on_log(GGML_LOG_LEVEL_WARN, "Empty token encountered", nullptr);
         return nullptr;
@@ -486,13 +401,18 @@ extern "C" char* llama_next() {
 
     tks_processed++;
 
+    // Re-init batch to feed the next token
     llama_batch_free(batch);
     batch = llama_batch_init(BATCH_SIZE, 0, 1);
     if (batch.n_tokens < BATCH_SIZE) {
+        // Add new token
         common_batch_add(batch, new_token_id, tks_processed - 1, {0}, true);
-        if (batch.n_tokens > 0) {
-            batch.logits[batch.n_tokens - 1] = true;
-        }
+
+        // ---- REMOVED:
+        // if (batch.n_tokens > 0) {
+        //    batch.logits[batch.n_tokens - 1] = true;
+        // }
+
         if (llama_decode(ctx, batch) != 0) {
             l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Decode failed", nullptr);
             return nullptr;
@@ -539,7 +459,7 @@ extern "C" char* llama_run(int len) {
         l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Memory allocation failed for response", nullptr);
         return nullptr;
     }
-    strncpy(ret, response.c_str(), response.size()+1);
+    strncpy(ret, response.c_str(), response.size() + 1);
     return ret;
 }
 
@@ -569,9 +489,10 @@ extern "C" int llama_add(char* new_string) {
         tks_processed++;
     }
 
-    if (batch.n_tokens > 0) {
-        batch.logits[batch.n_tokens - 1] = true;
-    }
+    // ---- REMOVED:
+    // if (batch.n_tokens > 0) {
+    //     batch.logits[batch.n_tokens - 1] = true;
+    // }
 
     if (llama_decode(ctx, batch) != 0) {
         l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to decode", nullptr);
