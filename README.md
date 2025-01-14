@@ -14,7 +14,7 @@ git submodule update --init --recursive
 
 Just run ./build.sh ( This will build the nessasary libraries inject them and compile the wasm)
 ```sh
-./build.sh
+./build2.sh
 ```
 
 ### Testing
