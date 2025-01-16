@@ -21,7 +21,7 @@
 #define CTX_SIZE 8192
 #define BATCH_SIZE 2048
 #define MAX_TOKEN_LEN 256
-#define DEBUG_MODE 0
+#define DEBUG_MODE 1
 
 #define DEBUG_PRINT(...) do { if (DEBUG_MODE) fprintf(stderr, __VA_ARGS__); } while (0)
 
@@ -30,14 +30,14 @@ struct params_struct {
     std::string prompt;
     int n_threads = 4;
     int n_threads_batch = 4;
-    float temperature = 0.8f;       // default 0.8
-    float top_p = 0.95f;            // default 0.95
-    int top_k = 40;                 // default 40
-    float repeat_penalty = 1.0f;    // default 1.0
-    int repeat_last_n = 64;         // default 64
-    float min_p = 0.05f;            // default 0.05
-    float frequency_penalty = 0.0f; // default off
-    float presence_penalty = 0.0f;  // default off
+    float temperature = 0.8f;       // good default for creative but controlled output
+    float top_p = 0.9f;            // slightly reduced from 0.95 for more focused sampling
+    int top_k = 40;                // helps limit sampling to more relevant tokens
+    float repeat_penalty = 1.1f;    // slight penalty to reduce repetition
+    int repeat_last_n = 64;         // look back window for repetition
+    float min_p = 0.05f;           // allow some variance while filtering very low prob tokens
+    float frequency_penalty = 0.0f; // keep off by default
+    float presence_penalty = 0.0f;  // keep off by default
 };
 
 static params_struct params;
@@ -136,9 +136,9 @@ void llama_reset_context() {
     ctx_params.n_ctx = std::min(CTX_SIZE, n_ctx_train);
     ctx_params.n_threads = 1;
     ctx_params.n_threads_batch = 1;
-    // offload_kqy disabled because it may hamper serialization/reloading process from cache
     ctx_params.offload_kqv = false;
     ctx_params.embeddings = false;
+    ctx_params.logits_all = true;
 
     ctx = llama_new_context_with_model(model, ctx_params);
 
@@ -163,28 +163,11 @@ extern "C" int llama_set_prompt(char* prompt) {
         return 1;
     }
 
-    common_batch_clear(batch);
-    if (batch.n_tokens >= BATCH_SIZE) {
-        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Batch overflow with BOS token", nullptr);
-        return 1;
-    }
-
-    // Add the BOS token explicitly:
-    common_batch_add(batch, llama_token_bos(model), 0, {0}, false);
-
-    if (llama_decode(ctx, batch) != 0) {
-        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Decode failed for BOS token", nullptr);
-        return 1;
-    }
-    tks_processed++;
-
-    // Keep chunking logic the same, but remove batch.logits[...] = true
-    const size_t chunk_size = BATCH_SIZE - 1; 
+    const size_t chunk_size = BATCH_SIZE;
     for (size_t i = 0; i < tokens_list.size(); i += chunk_size) {
         common_batch_clear(batch);
         
         size_t current_chunk_size = std::min(chunk_size, tokens_list.size() - i);
-        
         for (size_t j = 0; j < current_chunk_size; j++) {
             if (batch.n_tokens >= BATCH_SIZE) {
                 l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Batch overflow while adding tokens", nullptr);
@@ -195,17 +178,20 @@ extern "C" int llama_set_prompt(char* prompt) {
             tks_processed++;
         }
 
-        // ---- REMOVED:
-        // if (batch.n_tokens > 0) {
-        //     batch.logits[batch.n_tokens - 1] = true;
-        // }
-
         if (llama_decode(ctx, batch) != 0) {
             l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Decode failed for chunk", nullptr);
             return 1;
         }
     }
-    
+
+    // Add a dummy token to ensure we have valid logits
+    common_batch_clear(batch);
+    common_batch_add(batch, tokens_list.back(), tks_processed - 1, {0}, true);
+    if (llama_decode(ctx, batch) != 0) {
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Decode failed for final token", nullptr);
+        return 1;
+    }
+
     return 0;
 }
 
@@ -225,8 +211,7 @@ extern "C" char* llama_next() {
         return nullptr;
     }
 
-    int last_idx = (int)batch.n_tokens - 1;
-    float* logits = llama_get_logits_ith(ctx, last_idx);
+    float* logits = llama_get_logits(ctx);
     if (!logits) {
         l_llama_on_log(GGML_LOG_LEVEL_ERROR, "Failed to get logits", nullptr);
         return nullptr;
@@ -366,9 +351,18 @@ extern "C" char* llama_next() {
         }
     }
 
-    if (new_token_id == llama_token_eos(model)) {
-        DEBUG_PRINT("End of sequence token encountered\n");
-        return nullptr;
+    // Skip special tokens
+    if (new_token_id == llama_token_bos(model) || 
+        new_token_id == llama_token_eos(model)) {
+        DEBUG_PRINT("Skipping special token %d\n", new_token_id);
+        // Try to get the next best token that isn't special
+        for (const auto &c : candidates) {
+            if (c.second != llama_token_bos(model) && 
+                c.second != llama_token_eos(model)) {
+                new_token_id = c.second;
+                break;
+            }
+        }
     }
 
     const char* token_str = llama_token_get_text(model, new_token_id);
@@ -444,14 +438,35 @@ extern "C" char* llama_run(int len) {
 
     std::string response;
     response.reserve((size_t)len * MAX_TOKEN_LEN);
+    int valid_tokens = 0;
 
-    for (int i = 0; i < len; i++) {
+    while (valid_tokens < len) {
         char* next_token = llama_next();
         if (!next_token) {
-            break;
+            // If we got nullptr but have some response, continue
+            if (!response.empty()) {
+                continue;
+            }
+            // If we got nullptr and have no response yet, try a few more times
+            if (valid_tokens == 0) {
+                for (int retry = 0; retry < 3 && !next_token; retry++) {
+                    next_token = llama_next();
+                }
+                if (!next_token) {
+                    break;
+                }
+            } else {
+                break;
+            }
         }
         response += next_token;
         free(next_token);
+        valid_tokens++;
+    }
+
+    if (response.empty()) {
+        l_llama_on_log(GGML_LOG_LEVEL_ERROR, "No valid tokens generated", nullptr);
+        return nullptr;
     }
 
     char* ret = (char*)malloc(response.size() + 1);
